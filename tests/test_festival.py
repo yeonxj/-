@@ -49,9 +49,25 @@ class MatchingTests(unittest.TestCase):
         b['own']['look']='강아지상'
         b['own']['date']='실내'
         a['ranks']=['look','date']
-        self.assertAlmostEqual(app.directed(a,b),500/7)
+        b['own']['vibe']='에겐형'
+        b['own']['affection']='행동으로 챙김'
+        self.assertAlmostEqual(app.directed(a,b),500/9)
         a['ranks']=['social','plan']
-        self.assertAlmostEqual(app.directed(a,b),200/7)
+        self.assertAlmostEqual(app.directed(a,b),200/9)
+
+    def test_new_categories_affect_weighted_score(self):
+        a,b=profile(1),profile(2)
+        a['ideal']={k:['상관없음'] for k in app.CATEGORIES}
+        a['ranks']=['vibe','affection']
+        a['ideal']['vibe']=['테토형']
+        a['ideal']['affection']=['말로 표현']
+        b['own']['vibe']='에겐형'
+        b['own']['affection']='행동으로 챙김'
+        self.assertAlmostEqual(app.directed(a,b),400/9)
+        b['own']['affection']='둘 다'
+        self.assertAlmostEqual(app.directed(a,b),600/9)
+        b['own']['vibe']='테토형'
+        self.assertEqual(app.directed(a,b),100)
 
 
 class ApiTests(unittest.TestCase):
@@ -85,34 +101,35 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request('login',dict(pin='1010'))[0],200)
 
     def add(self,i,group):
-        self.login()
-        ticket=self.request('ticket',dict(group=group))[1]['ticket']
-        self.assertEqual(self.request('open',dict(ticket=ticket))[0],200)
-        self.assertEqual(self.request('state')[0],401)
+        ticket='P-'+format(i,'032X')
         p=profile(i)
-        code,body=self.request('submit',dict(ticket=ticket,person=p))
-        self.assertEqual(code,200,body)
-        self.assertEqual(self.request('submit',dict(ticket=ticket,person=p))[0],200)
+        body=dict(ticket=ticket,group=group,person=p)
+        code,result=self.request('submit',body)
+        self.assertEqual(code,200,result)
+        self.assertEqual(result['ticket'],ticket)
+        self.assertEqual(self.request('submit',body)[0],200)
         return ticket,p
 
-    def test_paid_registration_matching_backup_restore(self):
+    def test_direct_registration_matching_backup_restore(self):
         self.assertEqual(self.request('state')[0],401)
+        self.assertEqual(self.request('backup')[0],401)
+        self.assertEqual(self.request('match',{})[0],401)
+        self.assertEqual(self.request('cancel',dict(ticket='fake'))[0],401)
         self.assertEqual(self.request('login',dict(pin='0000'))[0],401)
-        self.assertEqual(self.request('submit',dict(ticket='fake',person=profile(5)))[0],401)
-        self.login()
-        payment=dict(group='남성',ticket='P-12345678ABCDEF00')
-        self.assertEqual(self.request('ticket',payment)[0],200)
-        self.assertEqual(self.request('ticket',payment)[0],200)
-        self.assertEqual(len(self.request('state')[1]['tickets']),1)
-        self.request('cancel',dict(ticket=payment['ticket']))
-        t1,_=self.add(1,'남성')
+        t1,p1=self.add(1,'남성')
         t2,_=self.add(2,'여성')
+        # Open submission does not unlock the admin APIs or expose other responses.
+        self.assertEqual(self.request('state')[0],401)
+        self.assertNotIn('ticket',self.request('session')[1])
         self.login()
         s=self.request('state')[1]
         self.assertEqual(len(s['people']),2)
-        self.assertEqual(len(s['tickets']),3)
+        self.assertEqual(len(s['tickets']),2)
+        self.assertEqual(self.request('ticket',dict(group='남성'))[0],404)
+        self.assertEqual(self.request('open',dict(ticket=t1))[0],404)
         run=self.request('match',{})[1]['run']
         self.assertEqual(len(run['matches']),1)
+        self.assertEqual(run['score_version'],app.SCORE_VERSION)
         self.assertEqual(self.request('delivery',dict(run=run['id'],ticket=t1,state='완료'))[0],200)
         raw=self.request('backup')[1]
         backup=app.DATA/'download.sqlite3'
@@ -120,31 +137,67 @@ class ApiTests(unittest.TestCase):
         with sqlite3.connect(backup) as c:
             self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0],'ok')
             self.assertEqual(c.execute('SELECT COUNT(*) FROM participants').fetchone()[0],2)
-            # Verify the downloaded file can restore a separate database.
             with sqlite3.connect(app.DATA/'restored.sqlite3') as restored:
                 c.backup(restored)
                 self.assertEqual(restored.execute('SELECT COUNT(*) FROM runs').fetchone()[0],1)
-        t3=self.request('ticket',dict(group='남성'))[1]['ticket']
-        self.assertEqual(self.request('match',{})[0],400)
-        self.request('cancel',dict(ticket=t3))
+                self.assertEqual(restored.execute('SELECT state FROM deliveries').fetchone()[0],'완료')
         self.assertFalse(self.request('state')[1]['stale'])
         self.request('cancel',dict(ticket=t2))
         self.assertTrue(self.request('state')[1]['stale'])
         self.assertEqual(self.request('delivery',dict(run=run['id'],ticket=t1,state='완료'))[0],400)
-        # Reinitialization preserves committed data.
+        self.assertEqual(self.request('submit',dict(ticket=t1,group='여성',person=p1))[0],400)
         app.init()
         with app.connect() as c:
             self.assertEqual(c.execute('SELECT COUNT(*) FROM participants').fetchone()[0],2)
 
-    def test_duplicate_instagram_does_not_consume_ticket(self):
+    def test_duplicate_instagram_rolls_back_ticket_and_can_be_corrected(self):
         self.add(1,'남성')
-        self.login()
-        ticket=self.request('ticket',dict(group='여성'))[1]['ticket']
-        self.request('open',dict(ticket=ticket))
+        ticket='P-00000000000000000000000000000002'
         p=profile(1)
-        self.assertEqual(self.request('submit',dict(ticket=ticket,person=p))[0],409)
+        body=dict(ticket=ticket,group='여성',person=p)
+        self.assertEqual(self.request('submit',body)[0],409)
+        with app.connect() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM tickets').fetchone()[0],1)
         p['instagram']='new_person'
-        self.assertEqual(self.request('submit',dict(ticket=ticket,person=p))[0],200)
+        self.assertEqual(self.request('submit',body)[0],200)
+        p['name']='변경된 응답'
+        self.assertEqual(self.request('submit',body)[0],400)
+
+    def test_validation_rejects_missing_new_answers_and_invalid_group(self):
+        p=profile(5)
+        ticket='P-00000000000000000000000000000005'
+        body=dict(ticket=ticket,group='기타',person=p)
+        self.assertEqual(self.request('submit',body)[0],400)
+        body['group']='남성'
+        del p['own']['affection']
+        self.assertEqual(self.request('submit',body)[0],400)
+        with app.connect() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM tickets').fetchone()[0],0)
+
+    def test_legacy_data_survives_and_old_results_are_invalidated(self):
+        old=profile(31)
+        for k in ('vibe','affection'):
+            old['own'].pop(k)
+            old['ideal'].pop(k)
+        old['ranks']=['look','date']
+        old['ideal']={k:['상관없음'] for k in old['ideal']}
+        with app.connect() as c:
+            c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)',('LEGACY','남성'))
+            c.execute('INSERT INTO participants(ticket,instagram,payload) VALUES (?,?,?)',('LEGACY',old['instagram'],json.dumps(old)))
+            # Unfinished pre-issued tickets from v1 must not block new matching.
+            c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)',('LEGACY-PENDING','여성'))
+        self.add(32,'여성')
+        self.login()
+        run=self.request('match',{})[1]['run']
+        self.assertEqual(len(run['matches']),1)
+        self.assertEqual(app.directed(old,profile(32)),100)
+        with app.connect() as c:
+            saved=json.loads(c.execute("SELECT payload FROM participants WHERE ticket='LEGACY'").fetchone()[0])
+            self.assertNotIn('vibe',saved['own'])
+            run.pop('score_version')
+            c.execute('UPDATE runs SET payload=? WHERE id=?',(json.dumps(run),run['id']))
+        self.assertTrue(self.request('state')[1]['stale'])
+        self.assertEqual(self.request('delivery',dict(run=run['id'],ticket='LEGACY',state='완료'))[0],400)
 
 
 if __name__=='__main__':

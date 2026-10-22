@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Festival kiosk. Standard-library only; run behind HTTPS for remote access."""
 import argparse
-import csv
 import hashlib
 import hmac
-import io
 import json
 import math
 import os
@@ -25,8 +23,11 @@ CATEGORIES = {
     'social': ['조용한 편', '중간', '활발한 편'],
     'date': ['실내', '야외', '둘 다'],
     'plan': ['즉흥적', '중간', '계획적'],
+    'vibe': ['테토형', '에겐형', '반반'],
+    'affection': ['말로 표현', '행동으로 챙김', '둘 다'],
 }
-LABELS = dict(look='외적 이미지', social='사교 성향', date='데이트 취향', plan='계획 성향')
+LABELS = dict(look='외적 이미지', social='사교 성향', date='데이트 취향', plan='계획 성향', vibe='테토·에겐 스타일', affection='애정 표현 방식')
+SCORE_VERSION = 2
 SESSIONS = {}
 ATTEMPTS = {}
 GUARD = threading.Lock()
@@ -100,10 +101,14 @@ def validate(p):
 
 def directed(a, b):
     total = 0
+    weight_sum = 0
     for k, opts in CATEGORIES.items():
-        prefs = a['ideal'][k]
-        actual = b['own'][k]
-        if prefs == ['상관없음'] or actual in prefs or (k == 'date' and (actual == '둘 다' or '둘 다' in prefs)):
+        # Earlier four-question responses remain intact; only known answers count.
+        prefs = a['ideal'].get(k)
+        actual = b['own'].get(k)
+        if not prefs or actual is None:
+            continue
+        if prefs == ['상관없음'] or actual in prefs or (k in ('date', 'affection') and (actual == '둘 다' or '둘 다' in prefs)):
             value = 1
         elif k in ('social', 'plan'):
             distance = min(abs(opts.index(actual) - opts.index(x)) for x in prefs)
@@ -112,7 +117,8 @@ def directed(a, b):
             value = 0
         weight = 3 if a['ranks'][0] == k else 2 if a['ranks'][1] == k else 1
         total += weight * value
-    return total / 7 * 100
+        weight_sum += weight
+    return total / weight_sum * 100 if weight_sum else 0
 
 
 def hungarian(matrix):
@@ -236,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == '/api/session':
                 s = self.session()
-                return self.reply(dict(admin=s.get('admin',0)>time.time(), ticket=s.get('ticket')))
+                return self.reply(dict(admin=s.get('admin',0)>time.time()))
             self.admin()
             if path == '/api/state':
                 with connect() as c:
@@ -245,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
                     run = json.loads(latest['payload']) if latest else None
                     delivery = {r['ticket']:r['state'] for r in c.execute('SELECT * FROM deliveries WHERE run=?',(latest['id'],))} if latest else {}
                     ps = people(c)
-                    return self.reply(dict(tickets=tickets,people=ps,run=run,delivery=delivery,stale=bool(run and run['people_digest'] != digest(ps))))
+                    return self.reply(dict(tickets=tickets,people=ps,run=run,delivery=delivery,stale=bool(run and (run['people_digest'] != digest(ps) or run.get('score_version') != SCORE_VERSION))))
             if path == '/api/backup':
                 file = snapshot()
                 return self.reply(file.read_bytes(), download='festival-backup.sqlite3')
@@ -293,28 +299,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(dict(error='비밀번호가 맞지 않습니다.'),401)
             ATTEMPTS.pop(addr,None)
             token = secrets.token_urlsafe(32)
-            s = self.session()
-            SESSIONS[token] = dict(expires=time.time()+12*3600,admin=time.time()+1800,ticket=s.get('ticket'))
+            SESSIONS[token] = dict(expires=time.time()+12*3600,admin=time.time()+1800)
             cookie = 'festival='+token+'; HttpOnly; SameSite=Strict; Path=/'
             if os.environ.get('COOKIE_SECURE') == '1':
                 cookie += '; Secure'
             return self.reply(dict(ok=True),cookie=cookie)
         if path == '/api/submit':
-            s = self.session()
-            ticket = s.get('ticket')
-            if not ticket or data.get('ticket') != ticket:
-                raise PermissionError('운영진이 접수 화면을 열어야 합니다.')
+            import re
+            ticket = data.get('ticket')
+            if not isinstance(ticket, str) or not re.fullmatch(r'P-[A-F0-9]{16,32}', ticket):
+                raise ValueError('접수 식별자가 올바르지 않습니다. 화면을 새로 열어 주세요.')
+            group = data.get('group')
+            if group not in ('남성', '여성'):
+                raise ValueError('매칭 그룹을 선택해 주세요.')
             p = validate(data.get('person'))
             with connect() as c:
-                t = c.execute('SELECT * FROM tickets WHERE id=?',(ticket,)).fetchone()
-                if not t or t['state'] != 'paid':
-                    raise ValueError('취소되었거나 유효하지 않은 접수번호입니다.')
-                prior = c.execute('SELECT payload FROM participants WHERE ticket=?',(ticket,)).fetchone()
+                prior = c.execute('SELECT p.payload,t.group_name,t.state FROM participants p JOIN tickets t ON p.ticket=t.id WHERE p.ticket=?', (ticket,)).fetchone()
                 if prior:
-                    if json.loads(prior['payload']) != p:
-                        raise ValueError('이미 저장된 접수번호입니다. 운영진에게 확인해 주세요.')
+                    if prior['state'] != 'paid':
+                        raise ValueError('취소된 접수번호입니다. 운영진에게 문의해 주세요.')
+                    if json.loads(prior['payload']) != p or prior['group_name'] != group:
+                        raise ValueError('이미 저장된 접수입니다. 운영진에게 확인해 주세요.')
                 else:
-                    c.execute('INSERT INTO participants(ticket,instagram,payload) VALUES (?,?,?)',(ticket,p['instagram'],json.dumps(p,ensure_ascii=False)))
+                    # Ticket and response are committed together: no pre-issuance or payment gate.
+                    c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)', (ticket,group))
+                    c.execute('INSERT INTO participants(ticket,instagram,payload) VALUES (?,?,?)', (ticket,p['instagram'],json.dumps(p,ensure_ascii=False)))
             # Commit is complete even if a secondary snapshot fails.
             warning = None
             try:
@@ -326,29 +335,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/lock':
             self.session()['admin'] = 0
             return self.reply(dict(ok=True))
-        if path == '/api/ticket':
-            group = data.get('group')
-            if group not in ('남성','여성'):
-                raise ValueError('매칭 그룹을 선택해 주세요.')
-            ticket = data.get('ticket') or 'P-'+secrets.token_hex(4).upper()
-            import re
-            if not isinstance(ticket,str) or not re.fullmatch(r'P-[A-F0-9]{8,32}',ticket):
-                raise ValueError('접수번호를 확인해 주세요.')
-            with connect() as c:
-                prior = c.execute('SELECT group_name FROM tickets WHERE id=?',(ticket,)).fetchone()
-                if prior and prior['group_name'] != group:
-                    raise ValueError('같은 접수번호의 그룹이 다릅니다.')
-                if not prior:
-                    c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)',(ticket,group))
-            return self.reply(dict(ticket=ticket))
-        if path == '/api/open':
-            ticket = data.get('ticket')
-            with connect() as c:
-                t = c.execute('SELECT t.* FROM tickets t LEFT JOIN participants p ON t.id=p.ticket WHERE t.id=? AND t.state=\'paid\' AND p.ticket IS NULL',(ticket,)).fetchone()
-                if not t:
-                    raise ValueError('입력 대기 중인 접수번호만 열 수 있습니다.')
-            self.session().update(ticket=ticket,admin=0)
-            return self.reply(dict(ticket=ticket,group=t['group_name']))
         if path == '/api/cancel':
             with connect() as c:
                 c.execute("UPDATE tickets SET state='cancelled' WHERE id=?",(data.get('ticket'),))
@@ -356,15 +342,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/match':
             with connect() as c:
                 ps = people(c)
-                pending = c.execute("SELECT COUNT(*) FROM tickets t LEFT JOIN participants p ON t.id=p.ticket WHERE t.state='paid' AND p.ticket IS NULL").fetchone()[0]
-                if pending:
-                    raise ValueError('결제 후 입력 대기 중인 참가자가 있습니다. 접수 완료 또는 취소 처리 후 실행해 주세요.')
                 if not any(p['group']=='남성' for p in ps) or not any(p['group']=='여성' for p in ps):
                     raise ValueError('남성과 여성이 각각 1명 이상 필요합니다.')
                 if len(ps)>400:
                     raise ValueError('회차당 최대 400명입니다. 운영 방식을 확인해 주세요.')
                 result = optimize(ps)
-                result.update(id=secrets.token_hex(8),created=time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime()),people_digest=digest(ps))
+                result.update(id=secrets.token_hex(8),created=time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime()),people_digest=digest(ps),score_version=SCORE_VERSION)
                 c.execute('INSERT INTO runs(id,payload) VALUES (?,?)',(result['id'],json.dumps(result,ensure_ascii=False)))
             return self.reply(dict(run=result))
         if path == '/api/delivery':
@@ -373,7 +356,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not r:
                     raise ValueError('매칭 결과가 없습니다.')
                 run = json.loads(r['payload'])
-                if run['people_digest'] != digest(people(c)):
+                if run['people_digest'] != digest(people(c)) or run.get('score_version') != SCORE_VERSION:
                     raise ValueError('참가자 명단이 변경되었습니다. 다시 매칭해 주세요.')
                 valid = {p['ticket'] for m in run['matches'] for p in (m['a'],m['b'])}
                 if data.get('ticket') not in valid or data.get('state') not in ('대기','완료','실패'):
