@@ -56,12 +56,18 @@ def init():
         CREATE TABLE IF NOT EXISTS participants (
           ticket TEXT PRIMARY KEY REFERENCES tickets(id), instagram TEXT UNIQUE NOT NULL,
           payload TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS participant_numbers (
+          number INTEGER PRIMARY KEY, ticket TEXT NOT NULL UNIQUE REFERENCES participants(ticket) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS runs (
           id TEXT PRIMARY KEY, payload TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS deliveries (
           run TEXT NOT NULL REFERENCES runs(id), ticket TEXT NOT NULL REFERENCES participants(ticket),
           state TEXT NOT NULL, PRIMARY KEY(run,ticket));
         ''')
+        # Backfill existing responses in their recorded submission order without changing IDs.
+        missing = c.execute('SELECT p.ticket FROM participants p LEFT JOIN participant_numbers n ON n.ticket=p.ticket WHERE n.ticket IS NULL ORDER BY p.created,p.rowid').fetchall()
+        for row in missing:
+            c.execute('INSERT INTO participant_numbers(ticket) VALUES (?)',(row['ticket'],))
 
 
 def snapshot(folder='backups'):
@@ -198,7 +204,7 @@ def optimize(people):
 
 
 def people(c):
-    return [dict(json.loads(r['payload']), ticket=r['ticket'], group=r['group_name']) for r in c.execute("SELECT p.*,t.group_name FROM participants p JOIN tickets t ON p.ticket=t.id WHERE t.state='paid' ORDER BY t.created,t.id")]
+    return [dict(json.loads(r['payload']), ticket=r['ticket'], group=r['group_name'], number=r['number']) for r in c.execute("SELECT p.*,t.group_name,n.number FROM participants p JOIN tickets t ON p.ticket=t.id JOIN participant_numbers n ON n.ticket=p.ticket WHERE t.state='paid' ORDER BY t.created,t.id")]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -257,6 +263,10 @@ class Handler(BaseHTTPRequestHandler):
                     tickets = [dict(r) for r in c.execute('SELECT t.*,p.ticket IS NOT NULL AS submitted FROM tickets t LEFT JOIN participants p ON p.ticket=t.id ORDER BY t.created DESC,t.id')]
                     latest = c.execute('SELECT * FROM runs ORDER BY created DESC,rowid DESC LIMIT 1').fetchone()
                     run = json.loads(latest['payload']) if latest else None
+                    if run:
+                        numbers = {r['ticket']:r['number'] for r in c.execute('SELECT * FROM participant_numbers')}
+                        for person in [p for m in run['matches'] for p in (m['a'],m['b'])] + run['unmatched']:
+                            person['number'] = numbers.get(person['ticket'],person.get('number'))
                     delivery = {r['ticket']:r['state'] for r in c.execute('SELECT * FROM deliveries WHERE run=?',(latest['id'],))} if latest else {}
                     ps = people(c)
                     return self.reply(dict(tickets=tickets,people=ps,run=run,delivery=delivery,stale=bool(run and (run['people_digest'] != digest(ps) or run.get('score_version') != SCORE_VERSION))))
@@ -335,13 +345,15 @@ class Handler(BaseHTTPRequestHandler):
                     # Ticket and response are committed together: no pre-issuance or payment gate.
                     c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)', (ticket,group))
                     c.execute('INSERT INTO participants(ticket,instagram,payload) VALUES (?,?,?)', (ticket,p['instagram'],json.dumps(p,ensure_ascii=False)))
+                    c.execute('INSERT INTO participant_numbers(ticket) VALUES (?)',(ticket,))
+                number = c.execute('SELECT number FROM participant_numbers WHERE ticket=?',(ticket,)).fetchone()[0]
             # Commit is complete even if a secondary snapshot fails.
             warning = None
             try:
                 snapshot()
             except Exception:
                 warning = '원본 저장은 완료되었으나 자동 백업 실패. 운영진이 백업을 확인해 주세요.'
-            return self.reply(dict(ok=True,ticket=ticket,warning=warning))
+            return self.reply(dict(ok=True,ticket=ticket,number=number,warning=warning))
         self.admin()
         if path == '/api/lock':
             self.session()['admin'] = 0
@@ -372,6 +384,7 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:
                 c.execute('DELETE FROM deliveries')
                 c.execute('DELETE FROM runs')
+                c.execute('DELETE FROM participant_numbers')
                 c.execute('DELETE FROM participants')
                 c.execute('DELETE FROM tickets')
                 c.execute("UPDATE app_settings SET value=? WHERE key='generation'",(result['generation'],))
@@ -413,7 +426,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def digest(ps):
-    return hashlib.sha256(json.dumps(ps,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    # Display numbering must not invalidate previously saved matches or DM progress.
+    payload = [{k:v for k,v in person.items() if k != 'number'} for person in ps]
+    return hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
 if __name__ == '__main__':

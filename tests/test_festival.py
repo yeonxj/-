@@ -108,7 +108,9 @@ class ApiTests(unittest.TestCase):
         code,result=self.request('submit',body)
         self.assertEqual(code,200,result)
         self.assertEqual(result['ticket'],ticket)
-        self.assertEqual(self.request('submit',body)[0],200)
+        retried=self.request('submit',body)
+        self.assertEqual(retried[0],200)
+        self.assertEqual(retried[1]['number'],result['number'])
         return ticket,p
 
     def test_direct_registration_matching_backup_restore(self):
@@ -187,6 +189,7 @@ class ApiTests(unittest.TestCase):
             c.execute('INSERT INTO participants(ticket,instagram,payload) VALUES (?,?,?)',('LEGACY',old['instagram'],json.dumps(old)))
             # Unfinished pre-issued tickets from v1 must not block new matching.
             c.execute('INSERT INTO tickets(id,group_name) VALUES (?,?)',('LEGACY-PENDING','여성'))
+        app.init()
         self.add(32,'여성')
         self.login()
         run=self.request('match',{})[1]['run']
@@ -231,6 +234,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.request('submit',dict(ticket=t1,group='남성',person=p1,generation=generation))[0],409)
         self.assertEqual(self.request('submit',dict(ticket=t1,group='남성',person=p1))[0],409)
         self.add(3,'남성')
+        self.assertEqual(self.request('state')[1]['people'][0]['number'],1)
         # A lost reset response followed by retry must not wipe subsequent registrations.
         self.assertEqual(self.request('reset',request),(200,result))
         self.assertEqual(len(self.request('state')[1]['people']),1)
@@ -248,6 +252,56 @@ class ApiTests(unittest.TestCase):
         self.assertIn('기존 데이터는 유지',result['error'])
         self.assertEqual(len(self.request('state')[1]['people']),1)
         self.assertEqual(self.request('session')[1]['generation'],generation)
+
+    def test_sequential_numbers_survive_restart_cancellation_and_failed_submission(self):
+        t1,_=self.add(90,'남성')
+        self.add(10,'여성')
+        self.login()
+        state=self.request('state')[1]
+        self.assertEqual([(p['ticket'],p['number']) for p in sorted(state['people'],key=lambda p:p['number'])],[(t1,1),('P-'+format(10,'032X'),2)])
+        self.request('cancel',dict(ticket=t1))
+        app.init()
+        self.add(5,'남성')
+        self.assertEqual(sorted(p['number'] for p in self.request('state')[1]['people']),[2,3])
+        body=dict(ticket='P-'+format(7,'032X'),group='여성',person=profile(10))
+        self.assertEqual(self.request('submit',body)[0],409)
+        body['person']['instagram']='unique_new_account'
+        code,result=self.request('submit',body)
+        self.assertEqual(code,200)
+        self.assertEqual(result['number'],4)
+
+    def test_number_migration_keeps_previous_match_and_delivery(self):
+        self.add(9,'남성')
+        self.add(3,'여성')
+        self.login()
+        run=self.request('match',{})[1]['run']
+        ticket=run['matches'][0]['a']['ticket']
+        self.request('delivery',dict(run=run['id'],ticket=ticket,state='완료'))
+        # Recreate the previous schema and saved result shape before upgrading.
+        with app.connect() as c:
+            for m in run['matches']:
+                m['a'].pop('number')
+                m['b'].pop('number')
+            c.execute('UPDATE runs SET payload=? WHERE id=?',(json.dumps(run),run['id']))
+            c.execute('DROP TABLE participant_numbers')
+        app.init()
+        app.init()
+        state=self.request('state')[1]
+        self.assertEqual(sorted(p['number'] for p in state['people']),[1,2])
+        self.assertFalse(state['stale'])
+        self.assertEqual(state['delivery'][ticket],'완료')
+        self.assertEqual({state['run']['matches'][0][k]['number'] for k in ('a','b')},{1,2})
+
+    def test_concurrent_kiosks_receive_unique_consecutive_numbers(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def submit(i):
+            body=dict(ticket='P-'+format(i,'032X'),group='남성',person=profile(i))
+            req=urllib.request.Request(self.base+'/api/submit',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read())['number']
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            numbers=list(pool.map(submit,range(1,9)))
+        self.assertEqual(sorted(numbers),list(range(1,9)))
 
 
 if __name__=='__main__':
