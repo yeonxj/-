@@ -24,6 +24,7 @@ dialog{border:1px solid var(--line);border-radius:18px;padding:24px;width:min(42
 <div class="card"><h2>🔐 운영진 관리 화면</h2><p class="hint">참가자는 로그인 없이 바로 입력합니다. 결제는 현장에서 별도로 확인하고, 여기서는 명단·매칭·백업을 관리하세요.</p>
 <div class="statrow"><div class="stat"><strong id="savedCount">0</strong><small>접수 완료</small></div><div class="stat"><strong id="maleCount">0</strong><small>남성</small></div><div class="stat"><strong id="femaleCount">0</strong><small>여성</small></div></div>
 <div class="actions"><button class="btn secondary" onclick="refreshAdmin()">새로고침</button><button class="btn secondary" onclick="backup()">💾 전체 백업 다운로드</button><button class="btn secondary" onclick="lock()">운영진 화면 잠금</button></div>
+<div class="actions"><button class="btn secondary" style="color:#b42318;border:1px solid #edc3bf" onclick="openReset()">🗑️ 전체 데이터 초기화</button></div>
 <p class="hint">원본은 서버 데이터베이스에 저장됩니다. 접수마다 서버 내부 백업을 만들지만, 서버 기기 고장에 대비해 외부 저장장치에도 백업을 보관하세요. 두 기기를 쓴다면 반드시 같은 서버에 접속하세요.</p></div>
 <div class="card"><h2>📊 신청자 목록</h2><p id="groupCounts" class="hint"></p><div id="peopleTable" class="tableScroll"></div></div>
 <div class="card"><h2>🧠 전체 매칭 최적화</h2><p class="hint">① 매칭 인원 최대화 → ② 가장 낮은 개인 선호 점수 최대화 → ③ 상호 점수 합 최대화. 남녀 인원 차이만큼 미매칭이 발생할 수 있습니다. 선호 불일치로 자동 탈락시키지 않습니다.</p><div class="notice">실행 시점에 저장된 유효 참가자 전체를 한 회차로 배정합니다. 명단이 바뀌면 결과는 만료됩니다. DM 발송을 시작한 뒤에는 참가자를 추가하거나 재매칭하지 마세요.</div><button id="matchButton" class="btn primary" style="width:100%;margin-top:12px" onclick="runMatching(this)">💞 매칭 결과 생성 · 저장</button></div>
@@ -33,6 +34,7 @@ dialog{border:1px solid var(--line);border-radius:18px;padding:24px;width:min(42
 </div>
 <dialog id="loginDialog"><form id="loginForm"><h2>🔐 운영진 확인</h2><p class="hint">운영진 비밀번호를 입력해 주세요.</p><div class="field"><label for="pin">비밀번호</label><input id="pin" type="password" inputmode="numeric" autocomplete="off" required></div><p id="loginError" class="hint" role="alert"></p><div class="actions"><button class="btn secondary" type="button" onclick="document.getElementById('loginDialog').close()">취소</button><button class="btn primary" type="submit">확인</button></div></form></dialog>
 <dialog id="reviewDialog"><h2>💌 마지막으로 확인해 주세요</h2><p class="hint">아래 계정으로 결과를 안내합니다. 본인 아이디가 맞나요?</p><p id="reviewInsta" style="font-size:24px;font-weight:800;color:var(--pink);overflow-wrap:anywhere"></p><div class="actions"><button class="btn secondary" onclick="document.getElementById('reviewDialog').close()">수정하기</button><button class="btn primary" onclick="confirmSubmit()">맞아요 · 저장하기</button></div></dialog>
+<dialog id="resetDialog"><form id="resetForm"><h2>🗑️ 전체 데이터 초기화</h2><div class="notice">참가자 전체, 참가번호, 매칭 결과, DM 발송 기록을 비우고 새로 시작합니다.<br>삭제 전 복구용 백업을 서버의 <strong>data/reset-backups</strong> 폴더에 남깁니다. 기존 백업 파일은 삭제하지 않습니다.</div><p class="hint">다른 기기에서 입력 중이라면 먼저 중단해 주세요. 초기화 후 각 기기의 화면을 새로고침해야 합니다.</p><div class="field"><label for="resetPin">운영진 비밀번호 다시 입력</label><input id="resetPin" type="password" inputmode="numeric" autocomplete="off" required></div><p id="resetError" class="hint" role="alert"></p><div class="actions"><button id="resetCancel" class="btn secondary" type="button" onclick="closeReset()">취소</button><button id="resetSubmit" class="btn primary" type="submit">백업 후 전체 초기화</button></div></form></dialog>
 <script>'use strict';
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -45,7 +47,7 @@ const categories={
  affection:{label:'애정 표현 방식',options:['말로 표현','행동으로 챙김','둘 다'],icon:'💌'}
 };
 const draftKey='ie-festival-active-draft-v3';
-let ticket=null,busy=false,state=null,pending=null,retryTimer=null,finishTimer=null;
+let ticket=null,busy=false,state=null,pending=null,retryTimer=null,finishTimer=null,generation=null,resetRequest=null,resetting=false;
 function newId(){return 'P-'+Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join('').toUpperCase()}
 async function api(path,data){
  const r=await fetch('/api/'+path,{method:data===undefined?'GET':'POST',headers:data===undefined?{}:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});
@@ -68,7 +70,7 @@ function syncRanks(){for(const o of $('rank2').options)o.disabled=!!o.value&&o.v
 $('rank1').onchange=()=>{syncRanks();saveDraft()};
 $('questions').addEventListener('change',e=>{const t=e.target;if(t.name.startsWith('ideal_')&&t.checked){for(const x of document.getElementsByName(t.name)){if(x!==t&&(t.value==='상관없음'||x.value==='상관없음'))x.checked=false}}saveDraft()});
 function person(){const f=new FormData($('joinForm')),own={},ideal={};for(const k in categories){own[k]=f.get('own_'+k);ideal[k]=f.getAll('ideal_'+k)}return {name:$('nickname').value.trim(),instagram:$('instagram').value.trim().replace(/^@/,'').toLowerCase(),own,ideal,ranks:[$('rank1').value,$('rank2').value],consent:$('consent').checked}}
-function persistDraft(d){try{sessionStorage.setItem(draftKey,JSON.stringify(d));return true}catch{return false}}
+function persistDraft(d){try{sessionStorage.setItem(draftKey,JSON.stringify({generation,...d}));return true}catch{return false}}
 function saveDraft(){if(!ticket||busy||pending)return;const ok=persistDraft({ticket,group:$('group').value,person:person(),confirmed:$('confirmInsta').checked});$('saveState').textContent=ok?'입력 중 · 이 기기에 임시 보관됨 (접수 미완료)':'기기 임시 보관을 사용할 수 없습니다. 입력 중 화면을 닫지 마세요.'}
 $('joinForm').addEventListener('input',saveDraft);
 $('joinForm').addEventListener('change',saveDraft);
@@ -79,18 +81,20 @@ function openForm(){
 function restoreDraft(){
  let d;try{d=JSON.parse(sessionStorage.getItem(draftKey)||sessionStorage.getItem('ie-festival-active-draft-v2')||'null')}catch{return}
  if(!d?.person)return;
+ if((d.generation||'initial')!==generation){try{sessionStorage.removeItem(draftKey);sessionStorage.removeItem('ie-festival-active-draft-v2')}catch{}notice('초기화 전 임시 입력을 비웠습니다. 새 참가자는 다시 작성해 주세요.');return}
  const p=d.person;
  if(/^P-[A-F0-9]{16,32}$/.test(d.ticket))ticket=d.ticket;
  $('nickname').value=p.name||'';$('instagram').value=p.instagram||'';$('group').value=d.group||'';
  for(const k in categories){for(const x of document.getElementsByName('own_'+k))x.checked=x.value===p.own?.[k];for(const x of document.getElementsByName('ideal_'+k))x.checked=!!p.ideal?.[k]?.includes(x.value)}
  $('rank1').value=p.ranks?.[0]||'';$('rank2').value=p.ranks?.[1]||'';syncRanks();$('consent').checked=!!p.consent;$('confirmInsta').checked=!!d.confirmed;
  notice('이 기기에 남아 있는 입력을 복구했습니다. 빈 문항이 있다면 선택해 주세요.');
- if(d.pending){pending={ticket,group:d.group,person:p};setFormDisabled(true);sendPending()}
+ if(d.pending){pending={ticket,group:d.group,person:p,generation:d.generation||'initial'};setFormDisabled(true);sendPending()}
 }
 $('joinForm').addEventListener('submit',e=>{e.preventDefault();if(busy||pending)return;const p=person();if(Object.values(p.ideal).some(x=>!x.length))return notice('원하는 상대 성향을 각 항목에서 하나 이상 선택해 주세요.');if(!p.ranks[0]||!p.ranks[1]||p.ranks[0]===p.ranks[1])return notice('중요도 1·2순위는 서로 다르게 선택해 주세요.');$('reviewInsta').textContent='@'+p.instagram;$('reviewDialog').showModal()});
 function confirmSubmit(){
  $('reviewDialog').close();if(busy||pending)return;
- pending={ticket,group:$('group').value,person:person()};
+ if(!generation)return notice('서버 연결을 확인 중입니다. 잠시 후 다시 시도해 주세요.');
+ pending={ticket,group:$('group').value,person:person(),generation};
  persistDraft({...pending,confirmed:true,pending:true});setFormDisabled(true);sendPending();
 }
 async function sendPending(){
@@ -104,8 +108,25 @@ async function sendPending(){
   else{notice('입력을 유지하고 있습니다. 연결 복구 후 10초 간격으로 재시도합니다.');retryTimer=setTimeout(sendPending,10000)}
  }finally{busy=false;$('submitButton').disabled=!!pending}
 }
-window.addEventListener('online',()=>{if(pending)sendPending()});
+window.addEventListener('online',()=>{if(pending)sendPending();else if(!generation)bootstrap()});
 function finish(){if(busy||pending)return;clearTimeout(finishTimer);clearTimeout(retryTimer);try{sessionStorage.removeItem(draftKey);sessionStorage.removeItem('ie-festival-active-draft-v2')}catch{}openForm();notice('');window.scrollTo({top:0,behavior:'smooth'})}
+function openReset(){if(pending||busy)return notice('접수 저장을 먼저 완료해 주세요.');resetRequest=null;$('resetPin').value='';$('resetError').textContent='';$('resetDialog').showModal()}
+function closeReset(){if(resetting)return;resetRequest=null;$('resetPin').value='';$('resetDialog').close()}
+$('resetDialog').addEventListener('cancel',e=>{if(resetting)e.preventDefault();else closeReset()});
+$('resetForm').addEventListener('submit',async e=>{
+ e.preventDefault();if(resetting)return;
+ if(!resetRequest)resetRequest={request_id:newId().slice(2),generation};
+ resetting=true;$('resetSubmit').disabled=true;$('resetCancel').disabled=true;$('resetError').textContent='백업과 초기화 진행 중…';
+ try{
+  const result=await api('reset',{...resetRequest,pin:$('resetPin').value,confirm:'초기화'});
+  clearTimeout(retryTimer);clearTimeout(finishTimer);pending=null;busy=false;
+  try{sessionStorage.removeItem(draftKey);sessionStorage.removeItem('ie-festival-active-draft-v2')}catch{}
+  generation=result.generation;openForm();purgeAdmin();$('resetDialog').close();$('resetPin').value='';resetRequest=null;
+  if(await refreshAdmin())tab(true);
+  notice('전체 초기화 완료 · 복구용 백업: data/'+result.backup+' · 다음 참가자부터 새로 입력할 수 있습니다.');
+ }catch(e){$('resetError').textContent=e.message+(e.status?'':' 같은 버튼으로 재시도해 주세요. 중복 초기화는 실행되지 않습니다.');if(e.status&&e.status<500)resetRequest=null}
+ finally{resetting=false;$('resetSubmit').disabled=false;$('resetCancel').disabled=false}
+});
 async function cancelTicket(t){if(!confirm(t+' 접수를 취소할까요? 환불은 별도로 처리하고 기록해 주세요.'))return;try{await api('cancel',{ticket:t});await refreshAdmin()}catch(e){notice(e.message)}}
 async function refreshAdmin(){try{state=await api('state');renderAdmin();return true}catch(e){purgeAdmin();tab(false);notice(e.message);return false}}
 function renderAdmin(){
@@ -123,6 +144,10 @@ $('adminView').addEventListener('change',async e=>{if(!e.target.dataset.delivery
 async function runMatching(btn){if(!confirm('모든 참가자의 입력과 참석 여부를 확인하셨나요? 기존 DM을 발송했다면 재매칭하지 마세요.'))return;btn.disabled=true;try{await api('match',{});await refreshAdmin();notice('매칭 결과를 서버에 저장했습니다. 외부 백업도 내려받아 주세요.')}catch(e){notice(e.message)}finally{btn.disabled=false}}
 async function backup(){try{const r=await fetch('/api/backup');if(!r.ok){const b=await r.json();throw Error(b.error)}const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);a.href=url;a.download='festival-backup-'+new Date().toISOString().replace(/[:.]/g,'-')+'.sqlite3';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);notice('백업 다운로드를 요청했습니다. 실제 파일이 저장됐는지 확인하고 외부 기기에도 보관해 주세요.')}catch(e){notice(e.message)}}
 let idle;function activity(){clearTimeout(idle);idle=setTimeout(()=>{if(!$('adminView').classList.contains('hidden'))lock()},180000)}for(const ev of ['pointerdown','keydown'])document.addEventListener(ev,activity);activity();
-openForm();restoreDraft();
-api('session').catch(()=>notice('서버에 연결할 수 없습니다. 서버를 실행한 뒤 브라우저에서 접속해 주세요.'));
+async function bootstrap(){
+ $('submitButton').disabled=true;
+ try{const s=await api('session');generation=s.generation||'initial';restoreDraft();if(!busy&&!pending)$('submitButton').disabled=false}
+ catch{notice('서버에 연결할 수 없습니다. 서버를 실행한 뒤 새로고침해 주세요.')}
+}
+openForm();bootstrap();
 </script></body></html>

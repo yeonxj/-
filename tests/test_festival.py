@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -103,7 +104,7 @@ class ApiTests(unittest.TestCase):
     def add(self,i,group):
         ticket='P-'+format(i,'032X')
         p=profile(i)
-        body=dict(ticket=ticket,group=group,person=p)
+        body=dict(ticket=ticket,group=group,person=p,generation=self.request('session')[1]['generation'])
         code,result=self.request('submit',body)
         self.assertEqual(code,200,result)
         self.assertEqual(result['ticket'],ticket)
@@ -198,6 +199,55 @@ class ApiTests(unittest.TestCase):
             c.execute('UPDATE runs SET payload=? WHERE id=?',(json.dumps(run),run['id']))
         self.assertTrue(self.request('state')[1]['stale'])
         self.assertEqual(self.request('delivery',dict(run=run['id'],ticket='LEGACY',state='완료'))[0],400)
+
+    def test_reset_requires_admin_pin_and_preserves_recoverable_backup(self):
+        t1,p1=self.add(1,'남성')
+        self.add(2,'여성')
+        generation=self.request('session')[1]['generation']
+        request=dict(pin='1010',confirm='초기화',request_id='A'*32,generation=generation)
+        self.assertEqual(self.request('reset',request)[0],401)
+        self.login()
+        run=self.request('match',{})[1]['run']
+        self.request('delivery',dict(run=run['id'],ticket=t1,state='완료'))
+        self.assertEqual(self.request('reset',{**request,'pin':'0000'})[0],403)
+        self.assertEqual(self.request('reset',{**request,'confirm':'no'})[0],400)
+        self.assertEqual(len(self.request('state')[1]['people']),2)
+        code,result=self.request('reset',request)
+        self.assertEqual(code,200,result)
+        self.assertNotEqual(result['generation'],generation)
+        state=self.request('state')[1]
+        self.assertEqual(state['people'],[])
+        self.assertEqual(state['tickets'],[])
+        self.assertIsNone(state['run'])
+        self.assertEqual(state['delivery'],{})
+        backup=app.DATA/result['backup']
+        self.assertTrue(backup.is_file())
+        with sqlite3.connect(backup) as c:
+            self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM participants').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM runs').fetchone()[0],1)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM deliveries').fetchone()[0],1)
+        # Another kiosk's old request must not put test data back after reset.
+        self.assertEqual(self.request('submit',dict(ticket=t1,group='남성',person=p1,generation=generation))[0],409)
+        self.assertEqual(self.request('submit',dict(ticket=t1,group='남성',person=p1))[0],409)
+        self.add(3,'남성')
+        # A lost reset response followed by retry must not wipe subsequent registrations.
+        self.assertEqual(self.request('reset',request),(200,result))
+        self.assertEqual(len(self.request('state')[1]['people']),1)
+        self.assertEqual(len(list((app.DATA/'reset-backups').glob('*.sqlite3'))),1)
+        app.init()
+        self.assertEqual(self.request('session')[1]['generation'],result['generation'])
+
+    def test_failed_reset_backup_keeps_all_data(self):
+        self.add(1,'남성')
+        self.login()
+        generation=self.request('session')[1]['generation']
+        with patch.object(app,'snapshot',side_effect=OSError('disk unavailable')):
+            code,result=self.request('reset',dict(pin='1010',confirm='초기화',request_id='B'*32,generation=generation))
+        self.assertEqual(code,500)
+        self.assertIn('기존 데이터는 유지',result['error'])
+        self.assertEqual(len(self.request('state')[1]['people']),1)
+        self.assertEqual(self.request('session')[1]['generation'],generation)
 
 
 if __name__=='__main__':

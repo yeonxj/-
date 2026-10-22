@@ -47,6 +47,9 @@ def init():
     with connect() as c:
         c.execute('PRAGMA journal_mode=WAL')
         c.executescript('''
+        CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT OR IGNORE INTO app_settings(key,value) VALUES ('generation','initial');
+        CREATE TABLE IF NOT EXISTS resets (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS tickets (
           id TEXT PRIMARY KEY, group_name TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'paid',
           created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -61,14 +64,17 @@ def init():
         ''')
 
 
-def snapshot():
+def snapshot(folder='backups'):
     stamp = str(time.time_ns())
-    dest = DATA / 'backups' / (stamp + '.sqlite3')
+    directory = DATA / folder
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / (stamp + '.sqlite3')
     with connect() as src, sqlite3.connect(dest) as target:
         src.backup(target)
     # Keep the latest 100 consistent snapshots, separately from the live database.
-    for old in sorted((DATA / 'backups').glob('*.sqlite3'))[:-100]:
-        old.unlink()
+    if folder == 'backups':
+        for old in sorted(directory.glob('*.sqlite3'))[:-100]:
+            old.unlink()
     return dest
 
 
@@ -242,7 +248,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == '/api/session':
                 s = self.session()
-                return self.reply(dict(admin=s.get('admin',0)>time.time()))
+                with connect() as c:
+                    generation = c.execute("SELECT value FROM app_settings WHERE key='generation'").fetchone()[0]
+                return self.reply(dict(admin=s.get('admin',0)>time.time(), generation=generation))
             self.admin()
             if path == '/api/state':
                 with connect() as c:
@@ -314,6 +322,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('성별을 선택해 주세요.')
             p = validate(data.get('person'))
             with connect() as c:
+                generation = c.execute("SELECT value FROM app_settings WHERE key='generation'").fetchone()[0]
+                if data.get('generation', 'initial') != generation:
+                    return self.reply(dict(error='운영진이 데이터를 초기화했습니다. 화면을 새로고침한 뒤 새로 입력해 주세요.'),409)
                 prior = c.execute('SELECT p.payload,t.group_name,t.state FROM participants p JOIN tickets t ON p.ticket=t.id WHERE p.ticket=?', (ticket,)).fetchone()
                 if prior:
                     if prior['state'] != 'paid':
@@ -335,6 +346,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/lock':
             self.session()['admin'] = 0
             return self.reply(dict(ok=True))
+        if path == '/api/reset':
+            import re
+            if not hmac.compare_digest(str(data.get('pin', '')), PIN):
+                return self.reply(dict(error='초기화 비밀번호가 맞지 않습니다.'),403)
+            operation = data.get('request_id')
+            if data.get('confirm') != '초기화' or not isinstance(operation,str) or not re.fullmatch(r'[A-F0-9]{32}',operation):
+                raise ValueError('초기화 확인 정보를 확인해 주세요.')
+            with connect() as c:
+                prior = c.execute('SELECT payload FROM resets WHERE id=?',(operation,)).fetchone()
+                if prior:
+                    return self.reply(json.loads(prior['payload']))
+                generation = c.execute("SELECT value FROM app_settings WHERE key='generation'").fetchone()[0]
+                if data.get('generation') != generation:
+                    return self.reply(dict(error='다른 기기에서 이미 초기화했습니다. 화면을 새로고침해 주세요.'),409)
+            # POSTs are serialized by GUARD: no participant can save between backup and reset.
+            try:
+                backup = snapshot('reset-backups')
+                with sqlite3.connect(backup) as c:
+                    if c.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                        raise RuntimeError('Backup integrity check failed')
+            except Exception:
+                return self.reply(dict(error='복구용 백업을 만들지 못해 초기화를 중단했습니다. 기존 데이터는 유지됩니다.'),500)
+            result = dict(ok=True, backup=str(backup.relative_to(DATA)), generation=secrets.token_hex(16))
+            with connect() as c:
+                c.execute('DELETE FROM deliveries')
+                c.execute('DELETE FROM runs')
+                c.execute('DELETE FROM participants')
+                c.execute('DELETE FROM tickets')
+                c.execute("UPDATE app_settings SET value=? WHERE key='generation'",(result['generation'],))
+                c.execute('INSERT INTO resets(id,payload) VALUES (?,?)',(operation,json.dumps(result)))
+            return self.reply(result)
         if path == '/api/cancel':
             with connect() as c:
                 c.execute("UPDATE tickets SET state='cancelled' WHERE id=?",(data.get('ticket'),))
