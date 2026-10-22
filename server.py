@@ -79,7 +79,7 @@ def validate(p):
     insta = str(p.get('instagram', '')).strip().lstrip('@').lower()
     import re
     if not name or len(name) > 24 or not re.fullmatch(r'[a-z0-9._]{1,30}', insta):
-        raise ValueError('닉네임과 인스타 아이디를 확인해 주세요.')
+        raise ValueError('이름과 인스타 아이디를 확인해 주세요.')
     own, ideal = p.get('own', {}), p.get('ideal', {})
     if not isinstance(own, dict) or not isinstance(ideal, dict):
         raise ValueError('문항을 확인해 주세요.')
@@ -311,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('접수 식별자가 올바르지 않습니다. 화면을 새로 열어 주세요.')
             group = data.get('group')
             if group not in ('남성', '여성'):
-                raise ValueError('매칭 그룹을 선택해 주세요.')
+                raise ValueError('성별을 선택해 주세요.')
             p = validate(data.get('person'))
             with connect() as c:
                 prior = c.execute('SELECT p.payload,t.group_name,t.state FROM participants p JOIN tickets t ON p.ticket=t.id WHERE p.ticket=?', (ticket,)).fetchone()
